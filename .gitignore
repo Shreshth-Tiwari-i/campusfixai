@@ -17,14 +17,20 @@ htmlcov/
 
 # Environment variables and secrets
 .env
+.env.*
 *.env
 secrets.toml
 .streamlit/secrets.toml
 
-# SQLite database files
+# SQLite databases, backups, journals and sidecars
 *.db
+*.db-*
+*.db.bak*
 *.sqlite
+*.sqlite-*
 *.sqlite3
+*.sqlite3-*
+*.sqlite3.bak*
 
 # IDE and OS metadata
 .vscode/

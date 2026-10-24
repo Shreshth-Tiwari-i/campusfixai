@@ -1,48 +1,57 @@
-"""Database module for CampusFix AI.
+"""SQLite persistence for CampusFix. Migrations never reset existing tickets."""
 
-Provides SQLite initialization and connection handling.
-"""
-
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+import json
+import re
 import sqlite3
 from typing import Optional, Union
 
-from triage import triage_complaint
+from triage import ALLOWED_CATEGORIES, ALLOWED_PRIORITIES, RULE_BASED_SOURCE, triage_complaint
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "campusfix.db"
-
 MAX_TITLE_LENGTH = 120
 MAX_DESCRIPTION_LENGTH = 2000
 MAX_BUILDING_LENGTH = 100
 MAX_ROOM_LENGTH = 50
+STUDENT_PRIORITY_SOURCE = "Student selected"
+STAFF_PRIORITY_SOURCE = "Staff override"
+AI_ACCEPTED_SOURCE = "AI suggestion accepted by staff"
+ALLOWED_STATUS_TRANSITIONS = {
+    "Reported": ["In Progress"],
+    "In Progress": ["Resolved"],
+    "Resolved": [],
+}
 
 
 def get_connection(db_path: Union[str, Path] = DEFAULT_DB_PATH) -> sqlite3.Connection:
-    """Return a connection to the SQLite database.
-
-    Args:
-        db_path: Path to the SQLite database file.
-
-    Returns:
-        sqlite3.Connection with Row row_factory enabled.
-    """
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), timeout=15)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 15000")
     return conn
 
 
+@contextmanager
+def _database(db_path=DEFAULT_DB_PATH):
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
 def init_db(db_path: Union[str, Path] = DEFAULT_DB_PATH) -> None:
-    """Safely initialize the SQLite database without overwriting existing data.
+    """Create a new database or add missing columns to the original schema.
 
-    Creates the complaints table if it does not already exist.
-
-    Args:
-        db_path: Path to the SQLite database file.
+    Existing IDs, priorities, timestamps and statuses are not changed. Legacy
+    priority provenance is backfilled only when no provenance was recorded.
     """
-    with get_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
+    with _database(db_path) as conn:
+        # Serialize first-run migrations if two Streamlit sessions start together.
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS complaints (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
@@ -57,9 +66,56 @@ def init_db(db_path: Union[str, Path] = DEFAULT_DB_PATH) -> None:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-            """
-        )
-        conn.commit()
+        """)
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(complaints)")}
+        additions = {
+            "requested_priority": "TEXT",
+            "rule_suggested_priority": "TEXT",
+            "priority_source": "TEXT",
+            "ai_review_json": "TEXT",
+            "ai_reviewed_at": "TEXT",
+        }
+        for name, sql_type in additions.items():
+            if name not in existing:
+                # Both identifiers and types come from the fixed dictionary above.
+                conn.execute(f"ALTER TABLE complaints ADD COLUMN {name} {sql_type}")
+        conn.execute("""
+            UPDATE complaints
+            SET priority_source = CASE
+                WHEN priority IS NULL THEN 'Not set'
+                WHEN triage_source = ? THEN ?
+                ELSE 'Existing priority'
+            END
+            WHERE priority_source IS NULL OR trim(priority_source) = ''
+        """, (RULE_BASED_SOURCE, RULE_BASED_SOURCE))
+        conn.execute("""
+            UPDATE complaints SET rule_suggested_priority = priority
+            WHERE rule_suggested_priority IS NULL AND triage_source = ?
+        """, (RULE_BASED_SOURCE,))
+
+
+def _validate_priority(priority, allow_none=False):
+    if priority is None and allow_none:
+        return
+    if priority not in ALLOWED_PRIORITIES:
+        raise ValueError("Priority must be High, Medium, or Low.")
+
+
+def _validate_fields(title, description, building, room):
+    clean = []
+    for label, value, maximum in (
+        ("Title", title, MAX_TITLE_LENGTH),
+        ("Description", description, MAX_DESCRIPTION_LENGTH),
+        ("Building", building, MAX_BUILDING_LENGTH),
+        ("Room number", room, MAX_ROOM_LENGTH),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{label} is required and cannot be empty or whitespace.")
+        value = value.strip()
+        if len(value) > maximum:
+            raise ValueError(f"{label} must not exceed {maximum} characters.")
+        clean.append(value)
+    return clean
 
 
 def create_complaint(
@@ -73,380 +129,198 @@ def create_complaint(
     triage_source: Optional[str] = None,
     auto_triage: bool = True,
     db_path: Union[str, Path] = DEFAULT_DB_PATH,
+    requested_priority: Optional[str] = None,
 ) -> int:
-    """Create a new complaint record in the database using parameterized SQL.
-
-    If auto_triage is True and no category is provided, applies deterministic
-    rule-based triage to determine category, priority, reason, and source.
-
-    Args:
-        title: Brief title summarizing the maintenance issue.
-        description: Detailed explanation of the issue.
-        building: Name or identifier of the campus building.
-        room: Room or area identifier (e.g., A-101).
-        category: Optional category override.
-        priority: Optional priority override.
-        triage_reason: Optional reason string.
-        triage_source: Optional triage source identifier.
-        auto_triage: Whether to auto-triage untriaged inputs via rule-based engine.
-        db_path: Path to the SQLite database file.
-
-    Returns:
-        The integer ID of the created complaint record.
-
-    Raises:
-        ValueError: If any required field is empty, whitespace-only, or exceeds length limits.
-        sqlite3.Error: If a database error occurs.
-    """
-    clean_title = (title or "").strip()
-    clean_description = (description or "").strip()
-    clean_building = (building or "").strip()
-    clean_room = (room or "").strip()
-
-    if not clean_title:
-        raise ValueError("Title is required and cannot be empty or whitespace.")
-    if not clean_description:
-        raise ValueError("Description is required and cannot be empty or whitespace.")
-    if not clean_building:
-        raise ValueError("Building is required and cannot be empty or whitespace.")
-    if not clean_room:
-        raise ValueError("Room number is required and cannot be empty or whitespace.")
-
-    if len(clean_title) > MAX_TITLE_LENGTH:
-        raise ValueError(f"Title must not exceed {MAX_TITLE_LENGTH} characters.")
-    if len(clean_description) > MAX_DESCRIPTION_LENGTH:
-        raise ValueError(f"Description must not exceed {MAX_DESCRIPTION_LENGTH} characters.")
-    if len(clean_building) > MAX_BUILDING_LENGTH:
-        raise ValueError(f"Building must not exceed {MAX_BUILDING_LENGTH} characters.")
-    if len(clean_room) > MAX_ROOM_LENGTH:
-        raise ValueError(f"Room number must not exceed {MAX_ROOM_LENGTH} characters.")
-
-    if auto_triage and category is None:
-        t_res = triage_complaint(clean_title, clean_description)
-        category = t_res.category
-        priority = t_res.priority
-        triage_reason = t_res.reason
-        triage_source = t_res.source
-    elif triage_source is None:
-        triage_source = "Not triaged"
-
-    with get_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
+    title, description, building, room = _validate_fields(title, description, building, room)
+    _validate_priority(priority, allow_none=True)
+    _validate_priority(requested_priority, allow_none=True)
+    if requested_priority is not None and priority is not None and requested_priority != priority:
+        raise ValueError("Conflicting requested priorities were supplied.")
+    if category is not None and category not in ALLOWED_CATEGORIES:
+        raise ValueError("Unknown complaint category.")
+    chosen = requested_priority if requested_priority is not None else priority
+    suggestion = triage_complaint(title, description) if auto_triage else None
+    if suggestion:
+        category = category or suggestion.category
+        triage_reason = triage_reason if triage_reason is not None else suggestion.reason
+        triage_source = triage_source or suggestion.source
+    rule_priority = suggestion.priority if suggestion else None
+    current_priority = chosen if chosen is not None else rule_priority
+    priority_source = STUDENT_PRIORITY_SOURCE if chosen is not None else (
+        RULE_BASED_SOURCE if suggestion else "Not set"
+    )
+    with _database(db_path) as conn:
+        cur = conn.execute("""
             INSERT INTO complaints (
-                title,
-                description,
-                building,
-                room,
-                status,
-                category,
-                priority,
-                triage_reason,
-                triage_source
-            )
-            VALUES (?, ?, ?, ?, 'Reported', ?, ?, ?, ?)
-            """,
-            (
-                clean_title,
-                clean_description,
-                clean_building,
-                clean_room,
-                category,
-                priority,
-                triage_reason,
-                triage_source,
-            ),
-        )
-        conn.commit()
-        return cursor.lastrowid
+                title, description, building, room, status, category, priority,
+                triage_reason, triage_source, requested_priority,
+                rule_suggested_priority, priority_source
+            ) VALUES (?, ?, ?, ?, 'Reported', ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            title, description, building, room, category, current_priority,
+            triage_reason, triage_source or "Not triaged", chosen,
+            rule_priority, priority_source,
+        ))
+        return int(cur.lastrowid)
 
 
-def triage_untriaged_complaints(
-    db_path: Union[str, Path] = DEFAULT_DB_PATH,
-) -> int:
-    """Find all untriaged complaints, apply rule-based triage, and persist suggestions.
-
-    Does not alter ticket IDs or statuses.
-
-    Args:
-        db_path: Path to the SQLite database file.
-
-    Returns:
-        The number of tickets successfully triaged.
-    """
-    with get_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT id, title, description
-            FROM complaints
-            WHERE triage_source = 'Not triaged' OR category IS NULL
-            """
-        )
-        rows = cursor.fetchall()
-        count = 0
-        for row in rows:
-            res = triage_complaint(row["title"], row["description"])
-            cursor.execute(
-                """
-                UPDATE complaints
-                SET category = ?,
-                    priority = ?,
-                    triage_reason = ?,
-                    triage_source = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (res.category, res.priority, res.reason, res.source, row["id"]),
-            )
-            count += 1
-        conn.commit()
-        return count
+def get_complaint(complaint_id: int, db_path=DEFAULT_DB_PATH) -> Optional[sqlite3.Row]:
+    with _database(db_path) as conn:
+        return conn.execute("SELECT * FROM complaints WHERE id = ?", (complaint_id,)).fetchone()
 
 
-
-def get_complaint(
-    complaint_id: int,
-    db_path: Union[str, Path] = DEFAULT_DB_PATH,
-) -> Optional[sqlite3.Row]:
-    """Retrieve a single complaint record by its primary key ID using parameterized SQL.
-
-    Args:
-        complaint_id: Primary key of the complaint to fetch.
-        db_path: Path to the SQLite database file.
-
-    Returns:
-        sqlite3.Row if found, otherwise None.
-    """
-    with get_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT * FROM complaints WHERE id = ?",
-            (complaint_id,),
-        )
-        return cursor.fetchone()
+def get_all_complaints(db_path=DEFAULT_DB_PATH) -> list[sqlite3.Row]:
+    with _database(db_path) as conn:
+        return conn.execute("SELECT * FROM complaints ORDER BY id DESC").fetchall()
 
 
 def format_ticket_id(complaint_id: int) -> str:
-    """Format an integer complaint primary key into a human-readable ticket ID.
-
-    Examples:
-        1 -> 'CF-000001'
-        2 -> 'CF-000002'
-
-    Args:
-        complaint_id: Positive integer database ID.
-
-    Returns:
-        Formatted ticket ID string.
-
-    Raises:
-        ValueError: If complaint_id is not a positive integer.
-    """
-    if not isinstance(complaint_id, int) or complaint_id <= 0:
-        raise ValueError(
-            f"Complaint ID must be a positive integer, got {complaint_id!r}"
-        )
+    if type(complaint_id) is not int or complaint_id <= 0:
+        raise ValueError("Complaint ID must be a positive integer.")
     return f"CF-{complaint_id:06d}"
 
 
 def parse_ticket_id(ticket_id: str) -> Optional[int]:
-    """Parse a human-readable ticket ID into its integer primary key.
-
-    Accepts format 'CF-000001' (case-insensitive, trims leading/trailing whitespace).
-
-    Args:
-        ticket_id: Ticket ID string to parse.
-
-    Returns:
-        The integer primary key if valid, or None if the format is invalid.
-    """
-    import re
-
-    if not ticket_id or not isinstance(ticket_id, str):
+    if not isinstance(ticket_id, str):
         return None
-
-    cleaned = ticket_id.strip()
-    match = re.match(r"^CF-(\d+)$", cleaned, re.IGNORECASE)
+    match = re.fullmatch(r"CF-([0-9]{1,18})", ticket_id.strip(), flags=re.IGNORECASE)
     if not match:
         return None
-
-    try:
-        val = int(match.group(1))
-        return val if val > 0 else None
-    except ValueError:
-        return None
+    value = int(match.group(1))
+    return value if 0 < value <= 9223372036854775807 else None
 
 
-def get_complaint_by_ticket_id(
-    ticket_id: str,
-    db_path: Union[str, Path] = DEFAULT_DB_PATH,
-) -> Optional[sqlite3.Row]:
-    """Perform a read-only lookup of a complaint by its formatted ticket ID.
-
-    Args:
-        ticket_id: Ticket ID string (e.g. 'CF-000001').
-        db_path: Path to the SQLite database file.
-
-    Returns:
-        sqlite3.Row if found, or None if the ID is invalid or not found.
-    """
-    parsed_id = parse_ticket_id(ticket_id)
-    if parsed_id is None:
-        return None
-    return get_complaint(parsed_id, db_path=db_path)
+def get_complaint_by_ticket_id(ticket_id: str, db_path=DEFAULT_DB_PATH):
+    parsed = parse_ticket_id(ticket_id)
+    return None if parsed is None else get_complaint(parsed, db_path=db_path)
 
 
-def get_complaint_counts(
-    db_path: Union[str, Path] = DEFAULT_DB_PATH,
-) -> dict:
-    """Calculate complaint summary counts from SQLite.
-
-    Definitions:
-        - Total: all complaints in the database.
-        - Pending: complaints with status 'Reported' or 'In Progress'.
-        - Resolved: complaints with status 'Resolved'.
-
-    Args:
-        db_path: Path to the SQLite database file.
-
-    Returns:
-        dict containing 'total', 'pending', and 'resolved' integer counts.
-    """
-    with get_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT
-                COUNT(*) AS total,
-                COALESCE(SUM(CASE WHEN status IN ('Reported', 'In Progress') THEN 1 ELSE 0 END), 0) AS pending,
-                COALESCE(SUM(CASE WHEN status = 'Resolved' THEN 1 ELSE 0 END), 0) AS resolved
+def get_complaint_counts(db_path=DEFAULT_DB_PATH) -> dict:
+    with _database(db_path) as conn:
+        row = conn.execute("""
+            SELECT COUNT(*) AS total,
+            COALESCE(SUM(CASE WHEN status IN ('Reported', 'In Progress') THEN 1 ELSE 0 END), 0) AS pending,
+            COALESCE(SUM(CASE WHEN status = 'Resolved' THEN 1 ELSE 0 END), 0) AS resolved
             FROM complaints
-            """
-        )
-        row = cursor.fetchone()
-        return {
-            "total": int(row["total"]) if row and row["total"] is not None else 0,
-            "pending": int(row["pending"]) if row and row["pending"] is not None else 0,
-            "resolved": int(row["resolved"]) if row and row["resolved"] is not None else 0,
-        }
-
-
-
-def get_all_complaints(
-    db_path: Union[str, Path] = DEFAULT_DB_PATH,
-) -> list[sqlite3.Row]:
-    """Retrieve all complaints from SQLite, ordered by newest first (ID descending).
-
-    Args:
-        db_path: Path to the SQLite database file.
-
-    Returns:
-        List of sqlite3.Row objects representing all complaints.
-    """
-    with get_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT
-                id,
-                title,
-                description,
-                building,
-                room,
-                status,
-                category,
-                priority,
-                triage_reason,
-                triage_source,
-                created_at,
-                updated_at
-            FROM complaints
-            ORDER BY id DESC
-            """
-        )
-        return cursor.fetchall()
-
-
-ALLOWED_STATUS_TRANSITIONS = {
-    "Reported": ["In Progress"],
-    "In Progress": ["Resolved"],
-    "Resolved": [],
-}
+        """).fetchone()
+        return {key: int(row[key]) for key in ("total", "pending", "resolved")}
 
 
 def update_complaint_status(
     complaint_id: int,
     new_status: str,
     expected_current_status: Optional[str] = None,
-    db_path: Union[str, Path] = DEFAULT_DB_PATH,
+    db_path=DEFAULT_DB_PATH,
 ) -> bool:
-    """Transition a complaint's status strictly according to the state machine.
-
-    Enforces allowed transitions:
-        Reported -> In Progress -> Resolved
-
-    Rejects backward transitions, skipped transitions, and advances from Resolved.
-    Updates the updated_at timestamp upon success.
-
-    Args:
-        complaint_id: Integer primary key of the complaint.
-        new_status: Target status to transition to.
-        expected_current_status: Optional expected status for optimistic concurrency check.
-        db_path: Path to the SQLite database file.
-
-    Returns:
-        True if the update succeeded.
-
-    Raises:
-        ValueError: If complaint does not exist, status transition is invalid,
-            or a stale update is detected.
-    """
-    with get_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT status FROM complaints WHERE id = ?",
-            (complaint_id,),
-        )
-        row = cursor.fetchone()
-        if not row:
-            raise ValueError(f"Complaint #{complaint_id} not found.")
-
-        current_status = row["status"]
-
-        if expected_current_status and current_status != expected_current_status:
-            raise ValueError(
-                f"Stale update detected: ticket is currently '{current_status}', "
-                f"expected '{expected_current_status}'."
-            )
-
-        if current_status == "Resolved":
-            raise ValueError("A resolved ticket cannot be advanced further.")
-
-        allowed = ALLOWED_STATUS_TRANSITIONS.get(current_status, [])
-        if new_status not in allowed:
-            raise ValueError(
-                f"Invalid transition from '{current_status}' to '{new_status}'. "
-                f"Allowed transition: {allowed[0] if allowed else 'None'}."
-            )
-
-        cursor.execute(
-            """
-            UPDATE complaints
-            SET status = ?, updated_at = CURRENT_TIMESTAMP
+    with _database(db_path) as conn:
+        row = conn.execute("SELECT status FROM complaints WHERE id = ?", (complaint_id,)).fetchone()
+        if row is None:
+            raise ValueError("Ticket not found.")
+        current = row["status"]
+        if expected_current_status is not None and current != expected_current_status:
+            raise ValueError("This ticket was updated elsewhere. Reload it and try again.")
+        if new_status not in ALLOWED_STATUS_TRANSITIONS.get(current, []):
+            raise ValueError(f"Invalid transition from '{current}' to '{new_status}'.")
+        cur = conn.execute("""
+            UPDATE complaints SET status = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ? AND status = ?
-            """,
-            (new_status, complaint_id, current_status),
-        )
-        if cursor.rowcount == 0:
-            raise ValueError(
-                "Update failed: ticket was concurrently updated or does not exist."
-            )
-
-        conn.commit()
-        return True
+        """, (new_status, complaint_id, current))
+        if cur.rowcount != 1:
+            raise ValueError("This ticket changed while saving. Reload and try again.")
+    return True
 
 
+def update_complaint_priority(
+    complaint_id: int,
+    new_priority: str,
+    expected_current_priority: Optional[str] = None,
+    db_path=DEFAULT_DB_PATH,
+    source: str = STAFF_PRIORITY_SOURCE,
+) -> bool:
+    _validate_priority(new_priority)
+    if source not in (STAFF_PRIORITY_SOURCE, AI_ACCEPTED_SOURCE):
+        raise ValueError("Unknown manual priority source.")
+    with _database(db_path) as conn:
+        row = conn.execute("SELECT priority FROM complaints WHERE id = ?", (complaint_id,)).fetchone()
+        if row is None:
+            raise ValueError("Ticket not found.")
+        current = row["priority"]
+        if expected_current_priority is not None and current != expected_current_priority:
+            raise ValueError("Priority changed elsewhere. Reload the ticket and try again.")
+        cur = conn.execute("""
+            UPDATE complaints SET priority = ?, priority_source = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND priority IS ?
+        """, (new_priority, source, complaint_id, current))
+        if cur.rowcount != 1:
+            raise ValueError("This ticket changed while saving. Reload and try again.")
+    return True
 
 
+def _apply_rule_suggestion(conn, row):
+    result = triage_complaint(row["title"], row["description"])
+    # Evaluate provenance in the UPDATE itself: a concurrent staff override must
+    # survive even if this function was given an older snapshot of the ticket.
+    conn.execute("""
+        UPDATE complaints SET category = ?, rule_suggested_priority = ?,
+        triage_reason = ?, triage_source = ?,
+        priority = CASE WHEN COALESCE(priority_source, '') IN ('', 'Not set', ?)
+            THEN ? ELSE priority END,
+        priority_source = CASE WHEN COALESCE(priority_source, '') IN ('', 'Not set', ?)
+            THEN ? ELSE priority_source END,
+        updated_at = CURRENT_TIMESTAMP WHERE id = ?
+    """, (
+        result.category, result.priority, result.reason, result.source,
+        RULE_BASED_SOURCE, result.priority, RULE_BASED_SOURCE, RULE_BASED_SOURCE, row["id"],
+    ))
+
+
+def refresh_rule_suggestion(complaint_id: int, db_path=DEFAULT_DB_PATH) -> bool:
+    """Explicitly refresh rules; never overwrite a student/staff priority."""
+    with _database(db_path) as conn:
+        row = conn.execute("SELECT * FROM complaints WHERE id = ?", (complaint_id,)).fetchone()
+        if row is None:
+            raise ValueError("Ticket not found.")
+        _apply_rule_suggestion(conn, row)
+    return True
+
+
+def triage_untriaged_complaints(db_path=DEFAULT_DB_PATH) -> int:
+    with _database(db_path) as conn:
+        rows = conn.execute("""
+            SELECT * FROM complaints
+            WHERE triage_source IS NULL OR triage_source = 'Not triaged' OR category IS NULL
+        """).fetchall()
+        for row in rows:
+            _apply_rule_suggestion(conn, row)
+        return len(rows)
+
+
+def save_ai_review(complaint_id: int, review: dict, db_path=DEFAULT_DB_PATH) -> None:
+    """Cache advisory output only. Current priority/status are never changed."""
+    from ai_assistant import validate_review
+    clean = validate_review(review)
+    clean["source"] = review.get("source", "Local AI — Gemma 4 E4B")
+    clean["model"] = review.get("model", "gemma4:e4b")
+    with _database(db_path) as conn:
+        cur = conn.execute("""
+            UPDATE complaints SET ai_review_json = ?, ai_reviewed_at = ? WHERE id = ?
+        """, (
+            json.dumps(clean, ensure_ascii=False),
+            datetime.now(timezone.utc).isoformat(timespec="seconds"), complaint_id,
+        ))
+        if cur.rowcount != 1:
+            raise ValueError("Ticket not found.")
+
+
+def get_saved_ai_review(ticket) -> Optional[dict]:
+    if not ticket or not ticket["ai_review_json"]:
+        return None
+    try:
+        from ai_assistant import validate_review
+        raw = json.loads(ticket["ai_review_json"])
+        clean = validate_review(raw)
+        clean["source"] = raw.get("source", "Local AI — Gemma 4 E4B")
+        clean["model"] = raw.get("model", "gemma4:e4b")
+        return clean
+    except (ValueError, TypeError, KeyError):
+        return None

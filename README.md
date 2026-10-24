@@ -1,180 +1,114 @@
 # CampusFix AI
 
-> **Transparent, deterministic campus facility maintenance tracking and triage.**
+A campus maintenance demo: report an issue, choose its priority, track its ticket, and let staff take it from **Reported → In Progress → Resolved**.
 
-CampusFix AI is a lightweight, reliable facility reporting and tracking portal designed for college campuses. It replaces messy WhatsApp messages, informal verbal complaints, and lost paper logs with structured ticket submission, deterministic rule-based triage, live dashboard metrics, and a controlled maintenance lifecycle.
+## What works
 
----
+- Required title, description, building and room fields with server-side validation.
+- Persistent SQLite tickets such as `CF-000001` and read-only student lookup.
+- Dashboard totals, pending/resolved counts, search, and status/priority/building filters.
+- A student can select **Low / Medium / High**, or use automatic rules.
+- Staff can override priority separately from status. Priority provenance stays visible.
+- Transparent rule-based category/priority suggestions. **Other defaults to Low only if no more specific or hazard rule matches.**
+- Optional, on-demand **Gemma 4 E4B via local Ollama**: review priority, request safe checks, or ask a short maintenance question.
+- AI recommendations do not automatically change the ticket. Staff must explicitly accept them.
+- Known hazard keywords trigger fixed escalation guidance instead of model-generated DIY instructions. That output is labelled **Safety rule — AI not called**, not AI-generated.
+- Responsive Streamlit interface with a sidebar, metric cards, separate workspaces, and clear source labels.
 
-## Problem & Solution
+## Run the existing project
 
-### The Problem
-On college campuses, facility issues (broken projectors, leaking washrooms, flickering lights, hazardous exposed wiring) are typically reported via informal channels. This creates:
-- **No visibility for students**: Students report an issue once and never know if anyone is working on it.
-- **Untriaged hazards**: Safety issues (sparks, severe leaks) sit in the same queue as minor cosmetic requests.
-- **Loss of accountability**: Maintenance staff lack a centralized queue with lifecycle history and audit timestamps.
+Requires Python 3.10+ and a modern browser. Use your existing project environment if it already works.
 
-### The Solution
-CampusFix AI provides:
-1. **Structured Student Reporting**: Clean form with validation, character limits, and whitespace trimming.
-2. **Deterministic Rule-Based Triage**: Instant suggestions for category, priority, and rationale without hallucinated AI responses.
-3. **Transparent Ticket IDs**: Easy-to-remember zero-padded reference numbers (`CF-000001`) tied directly to database primary keys.
-4. **Real-Time Live Dashboard**: Instant status visibility (`Total`, `Pending`, `Resolved`) calculated directly from SQLite.
-5. **Enforced Maintenance Lifecycle**: Unidirectional state machine (`Reported` $\rightarrow$ `In Progress` $\rightarrow$ `Resolved`) with database-level guards.
-6. **Public Status Lookup**: Read-only status checking by Ticket ID for students.
+### Windows / PowerShell — no activation required
 
----
-
-## Implemented Features
-
-| Feature | Description |
-|---|---|
-| **Issue Reporting** | Form capturing Title, Description, Building, and Room (accepts alphanumeric strings like `A-101`). Enforces required fields and length limits. |
-| **XSS & HTML Safety** | All user inputs are sanitized with `html.escape` to ensure complaint text is never rendered as raw HTML. |
-| **Human-Readable Ticket IDs** | Displays format `CF-000001` using the database row's `lastrowid`. Never computed from row counts or `MAX(id)`. |
-| **Rule-Based Triage Engine** | Evaluates keyword rules in documented order to assign Category (`Electrical`, `Plumbing`, `Network`, `AV/Equipment`, `Other`) and Priority (`High`, `Medium`, `Low`). |
-| **Bilingual Keyword Support** | Recognizes common English and Hindi/Hinglish terms (e.g. *bijli*, *pankha*, *nal leak*, *paani tapak raha*, *spark ho raha*, *plaster ukhad gaya*). |
-| **Real-Time Dashboard** | Metric cards for **Total**, **Pending** (*Reported* + *In Progress*), and **Resolved**, plus an interactive table updating immediately upon submission. |
-| **Status Indicators** | Visual badges for ticket lifecycle (`🟡 Reported`, `🔵 In Progress`, `🟢 Resolved`) and priority (`🔴 High`, `🟠 Medium`, `🟢 Low`). |
-| **Read-Only Status Lookup** | Students enter their Ticket ID to verify current status, location, timestamps, and triage suggestions. |
-| **Demo Admin Panel** | Staff portal to select tickets, view details, advance status through valid transitions, or run bulk triage on legacy tickets. |
-| **Database State Machine** | Strict database-level transition enforcement: blocks backward transitions, skipped transitions, and alterations to resolved tickets. |
-
----
-
-## Actual Technology Stack
-
-- **Language**: Python 3.14 (compatible with Python 3.10+)
-- **Web Framework**: [Streamlit](https://streamlit.io/) (v1.66.1)
-- **Database**: [SQLite 3](https://www.sqlite.org/) (embedded relational database with `sqlite3.Row` factory)
-- **Test Framework**: [pytest](https://docs.pytest.org/) (v9.1.1) with 30 automated unit and integration tests
-- **Security & Core Libraries**: Python standard library (`html`, `re`, `pathlib`, `typing`)
-
----
-
-## Installation & Setup
-
-### 1. Prerequisites
-- Python 3.10 or higher installed on your system.
-- Git (optional, for version tracking).
-
-### 2. Windows (PowerShell)
 ```powershell
-# Clone or navigate to the project root
-cd c:\Project\campusfixai
-
-# Create a project virtual environment
 python -m venv .venv
-
-# Activate the virtual environment
-.venv\Scripts\Activate.ps1
-
-# Install pinned dependencies
-pip install -r requirements.txt
-
-# Run the Streamlit application
-streamlit run app.py
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m streamlit run app.py --server.address 127.0.0.1
 ```
 
-### 3. Linux / macOS (bash/zsh)
+### macOS / Linux — no activation required
+
 ```bash
-# Navigate to the project root
-cd campusfixai
-
-# Create a project virtual environment
 python3 -m venv .venv
-
-# Activate the virtual environment
-source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run the Streamlit application
-streamlit run app.py
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m streamlit run app.py --server.address 127.0.0.1
 ```
 
-The application will be accessible at: **`http://localhost:8501`**
+Open `http://localhost:8501`. Reporting, tracking, rules and staff controls do **not** require Ollama.
 
----
+## Optional local AI
 
-## Running the Automated Test Suite
+Install/start Ollama, then:
 
-CampusFix AI includes a 30-test automated test suite covering database schema, input validation, state transitions, ticket lookup, triage keywords, and end-to-end workflows.
-
-```powershell
-# Windows
-.venv\Scripts\pytest.exe -v
-
-# Linux / macOS
-pytest -v
+```bash
+ollama pull gemma4:e4b
+ollama run gemma4:e4b "Reply with READY."
 ```
 
----
+Open a saved ticket under **Track a ticket** or **Staff desk**, expand **Local AI assistant**, choose **Review priority** or **Suggest safe next steps**, and click **Ask local assistant**. A question is optional.
 
-## How SQLite Persistence Works
+The Python server calls `http://127.0.0.1:11434/api/chat`, using `gemma4:e4b`, schema-shaped JSON, validation, and bounded timeouts. There are no model tools, cloud inference fallback, automatic repairs, or autonomous status updates. Model quality and speed depend on the hardware and report; no accuracy claim is made.
 
-1. **Storage Engine**: Data is persisted in a local SQLite database file named `campusfix.db` located in the project directory.
-2. **Safe Initialization**: On startup, `db.init_db()` executes `CREATE TABLE IF NOT EXISTS complaints (...)`. Existing complaints and table schema are preserved across server restarts and crashes.
-3. **Primary Key Auto-Increment**: The `id INTEGER PRIMARY KEY AUTOINCREMENT` column generates monotonic IDs. Newly created complaints return `cursor.lastrowid`, which formats directly into `CF-{id:06d}`.
-4. **Optimistic Concurrency & Transactions**: Status transitions execute atomic parameterized SQL (`UPDATE complaints SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = ?`). If another user modified the ticket concurrently, `cursor.rowcount == 0` and the update is rejected with an explicit error.
-5. **Isolated Testing**: Automated tests use pytest's `tmp_path` fixture to create throwaway temporary databases (`test_campusfix.db`), ensuring test runs never mutate or wipe development data.
+**Ollama and Streamlit must run on the same computer.** A remote preview/cloud deployment cannot call Ollama on a judge's or your laptop through its own `localhost`. The sidebar includes an explicit model-availability check; it does not claim that the model is connected before checking.
 
----
+If the model is offline, missing, slow, or returns invalid output, show an explicit warning and leave the complaint unchanged. Old valid assessments, if any, remain labelled with their review timestamp. Advice is generated only on request. A priority-only review does not include unrequested DIY steps.
 
-## Transparent Rule-Based Triage
+`OLLAMA_BASE_URL` can point to another **loopback** port on the same computer. Non-local endpoints are rejected by this local-only helper. Initial model/package downloads need internet; inference goes to the local endpoint.
 
-Rather than relying on opaque cloud APIs or unverified LLMs, CampusFix AI uses an explicit, deterministic keyword engine in `triage.py`:
+## Priorities and existing records
 
-```
-+-----------------------------------------------------------------------------------+
-|                            Documented Rule Hierarchy                              |
-+-----------------------------------------------------------------------------------+
-| Tier 1: Immediate Safety Hazards (Priority: High)                                 |
-|         - Electrical hazard (sparks, exposed wires, burning smell, short circuit)  |
-|         - Flooding hazard (severe flooding, pipe burst, water overflow)           |
-+-----------------------------------------------------------------------------------+
-| Tier 2: Core Utilities (Priority: Medium)                                         |
-|         - Plumbing (leaks, taps, clogged drains, flush)                           |
-|         - Network (Wi-Fi, Ethernet, router offline)                               |
-|         - AV/Equipment (projector, microphone, speaker, HDMI)                     |
-|         - Standard Electrical (fans, lights, AC, switches)                        |
-+-----------------------------------------------------------------------------------+
-| Tier 3: Minor Damage (Priority: Low)                                              |
-|         - Cosmetic (paint peeling, scratches, stains, chipped tiles)              |
-+-----------------------------------------------------------------------------------+
-| Tier 4: Fallback (Priority: Medium)                                               |
-|         - Unmatched text defaults to: Category 'Other', "Manual review needed"    |
-+-----------------------------------------------------------------------------------+
+- `priority` is the **current** queue priority.
+- `requested_priority` records the student's optional selection.
+- `rule_suggested_priority` records the separate rule recommendation.
+- `priority_source` shows whether it came from rules, the student, staff, or an AI recommendation explicitly accepted by staff.
+- `ai_review_json` / `ai_reviewed_at` cache advisory output only. Saving advice does not change status, current priority or the ticket's modification timestamp.
+
+On startup, `init_db()` adds missing columns to the original schema. **It does not delete tickets, reset IDs, change statuses, or silently lower existing priorities.** It backfills provenance where it was absent.
+
+For legacy Other/Medium tickets, staff can explicitly use **Rule-based maintenance tools → Refresh this rule suggestion**. Automatically set priorities may then follow the new rules; student/staff choices remain unchanged. Existing manually set priorities are never overwritten by rule refresh or bulk triage.
+
+Back up `campusfix.db` before applying an update. Do not delete it to obtain a clean screenshot. For a separate synthetic demo database, use `CAMPUSFIX_DB_PATH` to point at a different path. Automated tests use temporary databases.
+
+## Tests
+
+From your project environment:
+
+```bash
+python -m pytest -q
 ```
 
-- **Triage Source**: Always explicitly tagged as **`Rule-based suggestion`**.
-- **Transparency**: Every suggestion displays the exact keyword that triggered the rule (e.g. *Rule matched 'Electrical hazard' on keyword 'sparks'*).
-- **No False Claims**: The application never claims an artificial intelligence or neural network evaluated the ticket.
+The included suite covers original-schema migration, persistent IDs, validation, manual priority, provenance, status transitions, counts, triage rules including Hindi, mocked local AI success/failure, safety gating, and Streamlit UI workflows. AI HTTP tests use mocks; they are not evidence of a successful real Gemma inference. Run a real-model check on your own machine before demonstrating AI.
 
----
+## Demo flow
 
-## Limitations
+1. Report a missing room label with automatic priority: **Other / Low**.
+2. Report another issue with a manually selected priority; show its source.
+3. Open Staff desk and change priority independently of status.
+4. Move a ticket through In Progress to Resolved; show dashboard totals.
+5. If Ollama is available, request a priority review or safe checks, then show that the current priority is unchanged until staff explicitly acts.
+6. Explain the next step: a pilot with actual college maintenance staff, after authentication and deployment review.
 
-1. **No Production Authentication**: The demo admin panel includes an unauthenticated role switcher for demonstration and evaluation purposes. A production release requires campus SSO / LDAP integration.
-2. **No Verified AI Accuracy**: Category and priority assignments are heuristic keyword suggestions. Ambiguous or misspelled descriptions may trigger the fallback category.
-3. **No Emergency-Response Guarantee**: CampusFix AI is an administrative facility ticketing platform. Critical life-safety emergencies (fires, gas leaks) require direct contact with campus emergency services.
-4. **Single-Node SQLite**: Suitable for single-campus pilots (~10,000 tickets/year), but enterprise multi-campus deployments will require PostgreSQL.
+See `demo_script.md` for a 90-second narrative.
 
----
+## Git hygiene
 
-## Next Step: Campus Pilot
+Commit source, requirements, tests, docs and `.streamlit/config.toml`. Do not commit virtual environments, real complaint databases, passwords, or `.streamlit/secrets.toml`.
 
-The immediate next milestone is a **4-week live pilot with college maintenance staff and hostel wardens**:
-- Deploy on a local campus server for one hostel block and one academic wing.
-- Validate triage keyword match rates against real student vernacular and regional terms.
-- Measure average resolution time from `Reported` to `Resolved`.
-- Gather usability feedback from facility technicians.
+**The source repository originally tracked `campusfix.db`, even though `.gitignore` listed it.** Ignoring a file does not untrack it. To stop tracking it while keeping your local copy:
 
----
+```bash
+git rm --cached campusfix.db
+git add .gitignore
+git commit -m "Keep local complaint database out of source control"
+```
 
-## Known Remaining Issues
+This does not erase a database already present in Git history. If it contains real personal information or credentials, handle that exposure separately; remove sensitive history where necessary and rotate exposed credentials. The update ZIP contains no database or real complaint records.
 
-1. **Browser Hard Reload State**: When a student hard-refreshes the browser page (`F5`), Streamlit resets session state, hiding the previous submission banner. Students can instantly retrieve their ticket using the **"Check Ticket Status"** section.
-2. **Attachment Support**: The MVP does not currently support image or photo attachments for reported issues.
-3. **Keyword Overlap**: While documented rule hierarchy guarantees deterministic evaluation, complex multi-issue complaints (e.g. *"light bulb fell into leaking sink"*) will match the higher-priority rule (Electrical) first.
+## Limitations / before a real campus pilot
+
+- **Demo Admin is not authenticated.** A page/role label is not authorization. Do not expose real campus data publicly. Add campus SSO, server-side role checks, permissions and auditing before a pilot.
+- Priority rules are heuristics, not verified hazard detection. Gemma can also be wrong, and the conservative safety filter is not a guarantee.
+- This portal is not an emergency response service. Keep away from danger and follow campus emergency procedures rather than waiting for a ticket.
+- SQLite is a simple single-server demo store. Assess concurrency, hosting persistence, access controls and backups before deployment; no production capacity claim is made.
+- No photo attachments, notifications or student accounts yet.

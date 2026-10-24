@@ -50,8 +50,8 @@ class _TriageRule:
         self.priority = priority
         self.patterns = patterns
         self.rule_name = rule_name
-        # Compile case-insensitive word-boundary regex
-        combined_pattern = r"\b(" + "|".join(patterns) + r")\b"
+        # Lookarounds also handle Hindi words ending in combining vowel marks.
+        combined_pattern = r"(?<!\w)(" + "|".join(patterns) + r")(?!\w)"
         self.regex = re.compile(combined_pattern, re.IGNORECASE)
 
     def match(self, text: str) -> Optional[str]:
@@ -68,9 +68,20 @@ class _TriageRule:
 # 2. Tier 2 - Specific Infrastructure & Utilities (Plumbing, Network,
 #    AV/Equipment, standard Electrical issues) -> Medium Priority.
 # 3. Tier 3 - Minor Cosmetic Damage -> Low Priority.
-# 4. Tier 4 - Fallback -> Other / Medium / "Manual review needed".
+# 4. Tier 4 - Fallback -> Other / Low; staff review may still be needed.
 # ==============================================================================
 TRIAGE_RULES: list[_TriageRule] = [
+    # Uncategorized hazards must never become Low just because they are Other.
+    _TriageRule(
+        category="Other",
+        priority="High",
+        patterns=[
+            r"gas leak(?:age)?", r"smell of gas", r"fire", r"smoke",
+            r"structural (?:damage|collapse)", r"ceiling (?:collapse|falling)",
+            r"blocked (?:emergency |fire )?exit",
+        ],
+        rule_name="Potential fire, gas, structural or blocked-exit hazard",
+    ),
     # 1. High Priority - Electrical Hazards
     _TriageRule(
         category="Electrical",
@@ -84,6 +95,8 @@ TRIAGE_RULES: list[_TriageRule] = [
             r"wire jal(?:a| gaya)?",
             r"spark ho raha",
             r"bijli shock",
+            r"water.{0,30}(?:socket|switchboard|electrical|wires?)",
+            r"चिंगारी", r"खुले तार",
         ],
         rule_name="Electrical hazard (sparks, exposed wires, burning smell)",
     ),
@@ -217,8 +230,8 @@ def triage_complaint(title: str, description: str) -> TriageResult:
     if not combined_text:
         return TriageResult(
             category="Other",
-            priority="Medium",
-            reason="Manual review needed",
+            priority="Low",
+            reason="No specific rule matched; staff review may be needed",
             source=RULE_BASED_SOURCE,
         )
 
@@ -235,10 +248,24 @@ def triage_complaint(title: str, description: str) -> TriageResult:
                 source=RULE_BASED_SOURCE,
             )
 
-    # Fallback for unmatched text
+    # Other is Low only when no higher-priority rule matched.
     return TriageResult(
         category="Other",
-        priority="Medium",
-        reason="Manual review needed",
+        priority="Low",
+        reason="No specific rule matched; staff review may be needed",
         source=RULE_BASED_SOURCE,
     )
+
+
+def get_safety_notice(title: str, description: str) -> Optional[str]:
+    """Conservative keyword gate, not a verified emergency detector."""
+    text = f"{title or ''} {description or ''}"
+    for rule in TRIAGE_RULES:
+        if rule.priority == "High" and rule.match(text):
+            return (
+                "Potential safety hazard. Keep away from the affected area and contact "
+                "campus maintenance/security directly. Do not touch exposed wires, open "
+                "equipment, or attempt a repair. If there is immediate danger, follow "
+                "your campus emergency procedure; do not wait for a ticket response."
+            )
+    return None
